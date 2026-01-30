@@ -4,6 +4,16 @@ This is the official code repository for the research paper *IDFuzz: Intelligent
 
 IDFuzz is an intelligent input mutation solution for directed fuzzing which leverages a neural network model to learn from historically mutated inputs and extracts useful experience that can guide input mutation towards the target code.
 
+## Environment Requirements
+
+- **OS**: Ubuntu 20.04.4 LTS
+- **Clang**: 10.0.0-4ubuntu1
+- **LLVM**: 10.0.0
+- **GNU Make**: 4.2.1
+- **Python**: 3.8
+
+For a complete environment setup, please refer to the Dockerfile in the `docker/` directory.
+
 ## Pipeline
 
 1. Build IDFuzz.
