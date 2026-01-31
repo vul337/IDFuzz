@@ -1,0 +1,3 @@
+main -> process_object,readelf.c:25387
+process_object -> process_file_header,readelf.c:24910
+process_object -> process_file_header,readelf.c:24975

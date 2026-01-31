@@ -98,6 +98,19 @@ For a complete environment setup, please refer to the Dockerfile in the `docker/
    tail -f $TMP_DIR/nn.log
 ```
 
+## Tips
+
+We provide an example directory at `./temp` for your reference. This example contains properly formatted files to help you:
+   - Verify that no files are missing
+   - Understand the expected content structure
+
+   **Improving fuzzing effectiveness:**
+
+   Due to limitations of static analysis tools, the automatically generated files may have incomplete content (e.g., missing target locations, incomplete call graphs). For better directed fuzzing results, you can:
+   - Examine vulnerability reports (e.g., ASan crash reports)
+   - Manually add missing targets to the corresponding files
+   - Follow the content structure shown in `./temp` example files
+
 ## Citation
 
 If you use IDFuzz in your research, please cite our paper:
