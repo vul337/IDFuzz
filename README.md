@@ -72,7 +72,7 @@ For a complete environment setup, please refer to the Dockerfile in the `docker/
 
 10. Run IDFuzz.
 ```shell
-   ./fuzz.sh [PUT_NAME] [INPUT_DIR] [OUTPUT_DIR] [SHM_ID] [TIMEOUT] [ARGS]
+   ./fuzz.sh [PUT_NAME] [INPUT_DIR] [OUTPUT_DIR] [SHM_ID] [TIME] [ARGS]
 ```
 
    **Parameters:**
@@ -80,7 +80,7 @@ For a complete environment setup, please refer to the Dockerfile in the `docker/
    - `INPUT_DIR`: Input seed directory (default: `in`)
    - `OUTPUT_DIR`: Fuzzing output directory (default: `out`)
    - `SHM_ID`: Shared memory ID for fuzzer-NN communication (default: `5`)
-   - `TIMEOUT`: Fuzzing timeout (default: `5m`)
+   - `TIME`: Time to exploitation (default: `10m`)
    - `ARGS`: Arguments for the target program (default: `-SD @@`)
 
    **Example:**
