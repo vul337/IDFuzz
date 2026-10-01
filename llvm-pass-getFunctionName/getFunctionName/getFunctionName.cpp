@@ -68,22 +68,35 @@ static std::list<std::string> getTargets(){
 namespace {
 struct getFunctionName : public FunctionPass {
   static char ID;
-  static std::list<std::string> targets;  
+  std::list<std::string> targets;
+  std::ofstream ftarget;
 
   getFunctionName() : FunctionPass(ID) {}
 
+  bool doInitialization(Module &M) override;
   bool runOnFunction(Function &F) override;
+  bool doFinalization(Module &M) override;
 
 }; // end of struct
 }  // end of anonymous namespace
 
 char getFunctionName::ID = 0;
-std::list<std::string> getFunctionName::targets = getTargets();  
+
+bool getFunctionName::doInitialization(Module &M) {
+  // Read the targets here rather than at plugin load time, so that -targets
+  // given on the command line is honored.
+  targets = getTargets();
+  // opt runs this pass once on the whole-program bitcode, so start a fresh file.
+  ftarget.open(OutFile, std::ios::trunc);
+  return false;
+}
+
+bool getFunctionName::doFinalization(Module &M) {
+  ftarget.close();
+  return false;
+}
 
 bool getFunctionName::runOnFunction(Function &F) {
-  std::ofstream ftarget;
-  ftarget.open(OutFile, std::ios::app);
-
   for (auto &BB : F) {
     std::string curr_filename = "";
     unsigned curr_line = 0;
@@ -116,7 +129,6 @@ bool getFunctionName::runOnFunction(Function &F) {
       }
     }
   }
-  ftarget.close();
   return 0;
 }
 

@@ -8,9 +8,11 @@ After training, calculate gradients for all seeds and store them in memory, read
 '''
 
 import os, sys
+import copy
 import glob
 import time
 import random
+import traceback
 import numpy as np
 import torch
 from torch import nn
@@ -18,8 +20,14 @@ from torch import optim
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
 import sysv_ipc as ipc
-from pwn import info, success
 # from tqdm import tqdm
+
+# Same output as pwntools' info/success, which were the only things used from it.
+def info(msg, *args):
+    print('[*] ' + (msg % args if args else msg), flush=True)
+
+def success(msg, *args):
+    print('[+] ' + (msg % args if args else msg), flush=True)
 
 # Choose a seed for random initialization
 rand_seed = int(time.time())
@@ -32,8 +40,14 @@ torch.manual_seed(rand_seed)
 argvv = sys.argv[1:]
 
 BATCH_SIZE = 32
-EPOCH = 5
 HIDDEN_NEURON = 512
+# Training settings. The original prototype used lr=1e-5 for 5 epochs with no
+# validation check; set IDFUZZ_LR=1e-5 IDFUZZ_EPOCHS=5 IDFUZZ_PATIENCE=0
+# IDFUZZ_QUALITY_GATE=0 to reproduce it.
+LEARNING_RATE = float(os.getenv('IDFUZZ_LR', '1e-3'))
+EPOCH = int(os.getenv('IDFUZZ_EPOCHS', '100')) # upper bound; early stopping usually ends sooner
+PATIENCE = int(os.getenv('IDFUZZ_PATIENCE', '5')) # epochs without validation improvement; 0 disables early stopping
+QUALITY_GATE = os.getenv('IDFUZZ_QUALITY_GATE', '1') != '0' # drop models that do not beat a constant predictor
 
 device = torch.device('cpu')
 # device = torch.device('cuda:1')
@@ -61,17 +75,48 @@ new_train = True # Whether a new training set was generated
 train_last_time = 0 # Time of the last training set generation
 last_query = "" # Last query
 
+def pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+def attach_shm(key):
+    # The fuzzer creates the segment. Wait for it instead of crashing if we
+    # start first, and ignore a segment left over from a dead fuzzer (the new
+    # fuzzer replaces it).
+    announced = False
+    while True:
+        try:
+            seg = ipc.SharedMemory(key, 0, 0)
+        except ipc.ExistentialError:
+            seg = None
+        if seg is not None:
+            if pid_alive(seg.creator_pid):
+                seg.attach(0, 0) # the implicit attach above is read-only
+                return seg
+            seg.detach()
+        if not announced:
+            info("Waiting for the fuzzer to create shared memory key %d", key)
+            announced = True
+        time.sleep(1)
+
 # Set up shared memory
 info("Setting up shared memory")
 try:
     shm_key = int(argvv[-1])
     info("Shared memory key %d", shm_key)
-except:
+except (IndexError, ValueError):
     info("Shared memory key ID needs to be an integer!")
     exit()
 
-shm = ipc.SharedMemory(shm_key, 0, 0)
-shm.attach(0, 0)
+shm = attach_shm(shm_key)
+fuzzer_pid = shm.creator_pid
 success("Shared memory is ready")
 
 '''
@@ -79,18 +124,34 @@ shm utils
 '''
 def shm_unlock():
     global shm
-    shm.write("\x00") # 0 indicates shared memory is released and available for fuzzer to read/write
+    shm.write(b"\x00") # 0 indicates shared memory is released and available for fuzzer to read/write
 
 def shm_hold():
     global shm
-    shm.write("\x02") # 2 indicates NN is training, fuzzer should not read/write
+    shm.write(b"\x02") # 2 indicates NN is training, fuzzer should not read/write
+
+def wait_for_fuzzer():
+    # Block until the fuzzer hands the shm over (flag 1). Poll with a short
+    # sleep rather than spinning a whole core, and exit once the fuzzer is gone.
+    global shm
+    spins = 0
+    last_check = time.monotonic()
+    while shm.read(1) != b'\x01': # 1 indicates shared memory has just been written by fuzzer, Python side can read/write
+        spins += 1
+        if spins < 200:
+            continue
+        time.sleep(0.0005)
+        now = time.monotonic()
+        if now - last_check > 1:
+            last_check = now
+            if not pid_alive(fuzzer_pid):
+                info("Fuzzer (pid %d) exited, stopping", fuzzer_pid)
+                shm_detach()
+                sys.exit(0)
 
 def myread():
     global shm
-    while True:
-        data = shm.read(1)
-        if (data == b'\x01'): # 1 indicates shared memory has just been written by fuzzer, Python side can read/write
-            break
+    wait_for_fuzzer()
     raw = shm.read(256)
     data_len = raw[1]
     data = raw[2:data_len+2]
@@ -98,13 +159,11 @@ def myread():
 
 def mywrite(input):
     global shm
-    while True:
-        data = shm.read(1)
-        if (data == b'\x01'): # 1 indicates shared memory has just been written by fuzzer, Python side can read/write
-            break
-    shm.write(input, offset=2)
-    shm.write(chr(len(input)), offset=1)
-    shm.write("\x00")
+    wait_for_fuzzer()
+    payload = input.encode()
+    shm.write(payload, offset=2)
+    shm.write(bytes([len(payload)]), offset=1)
+    shm.write(b"\x00")
 
 def shm_detach():
     global shm
@@ -199,12 +258,12 @@ def init():
             the_path = argvv[1] + '/queue/'
         else:
             the_path = argvv[1] + '/queue_backup/'
-        with open(the_path + filename, 'r') as f:
+        with open(the_path + filename, 'rb') as f:
             f_bytes = np.fromfile(f, dtype=np.uint8)
             if len(f_bytes) > max_file_length:
                 max_file_length = len(f_bytes)
             seed_length[filename] = len(f_bytes)
-        with open(bits, 'r') as f: 
+        with open(bits, 'rb') as f:
             bbs = [] # all covered dom BB ids
             bb_vec = []
             dom_bits = np.fromfile(f, dtype=np.uint8) # shape (65536,)
@@ -399,7 +458,7 @@ def init():
             the_path = argvv[1]+'/queue/'
         else:
             the_path = argvv[1]+'/queue_backup/'
-        with open(the_path + filename,'r') as f:
+        with open(the_path + filename,'rb') as f:
             f_bytes = np.fromfile(f, dtype=np.uint8)
             if len(f_bytes) > MAX_FILE_SIZE:
                 SEEDS_TRAIN.append(f_bytes[:MAX_FILE_SIZE])
@@ -496,11 +555,23 @@ def train(model,X,y):
     test_y = test_y.to(device)
 
     train_dataset = TensorDataset(train_x, train_y)
-    train_loader = DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    # BatchNorm cannot train on a single-sample batch, so only drop a trailing
+    # batch of one. Always dropping the last batch meant that trainsets with
+    # fewer than BATCH_SIZE training samples were never trained at all.
+    train_loader = DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                              drop_last=(len(train_x) % BATCH_SIZE == 1))
 
-    learning_rate = 1e-5
-    opt = optim.Adam(model.parameters(), lr = learning_rate)
+    opt = optim.Adam(model.parameters(), lr = LEARNING_RATE)
 
+    # Predicting the mean training label for every seed is the best constant
+    # guess. A model that cannot beat it on held-out seeds has not learned how
+    # input bytes affect dominator coverage, so its gradients are noise.
+    prior = train_y.mean(0, keepdim=True).clamp(1e-6, 1 - 1e-6).expand_as(test_y)
+    baseline_loss = nn.functional.binary_cross_entropy(prior, test_y).item()
+
+    best_loss = float('inf')
+    best_state = None
+    bad_epochs = 0
     for epoch in range(EPOCH):
         epoch_start_time = time.time()
         losses = []
@@ -515,18 +586,39 @@ def train(model,X,y):
             accs.append(acc.tolist())
             losses.append(loss.tolist())
 
-        train_loss = np.mean(losses)
-        train_acc = np.mean(accs)
+        train_loss = np.mean(losses) if losses else float('nan')
+        train_acc = np.mean(accs) if accs else float('nan')
 
         # eval the model
         epoch_duration = time.time() - epoch_start_time
         print(f"Epoch {epoch} took {epoch_duration:.2f} seconds.")
         print("epoch {}: loss {} accuracy {}".format(epoch,train_loss,train_acc))
         model.eval()
-        test_loss,test_acc = model(test_x,test_y)
+        with torch.no_grad():
+            test_pred = model(test_x)
+            test_loss = model.loss(test_pred, test_y).item() # BCE only, comparable to baseline_loss
+            test_acc = accur_1(test_y, test_pred)
         print("test epoch {}: loss {} accuracy {}".format(epoch,test_loss,test_acc))
         model.train()
-    return model
+
+        if test_loss < best_loss:
+            best_loss = test_loss
+            best_state = copy.deepcopy(model.state_dict())
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if PATIENCE > 0 and bad_epochs >= PATIENCE:
+                print("early stopping at epoch {}".format(epoch))
+                break
+    if PATIENCE > 0 and best_state is not None:
+        model.load_state_dict(best_state)
+    else:
+        best_loss = test_loss
+
+    useful = best_loss < baseline_loss
+    print("validation loss {:.4f}, constant-prediction baseline {:.4f}: {}".format(
+        best_loss, baseline_loss, "model is informative" if useful else "model is NOT better than baseline"))
+    return model, (useful or not QUALITY_GATE)
 
 def retrain():
     global DOM_BB_NUM
@@ -534,46 +626,59 @@ def retrain():
         try:
             X_filenames, X, y, DOM_BB_NUM, DOM_BITS, trainset_balance, dom_bits_levels, trainset_levels = init()
             break
-        except:
+        except TrainsetException:
             print('There is only one label in the trainset! Retrain in 5min!')
             time.sleep(300)
+        except Exception:
+            traceback.print_exc()
+            print('Failed to build the trainset! Retrain in 5min!')
+            time.sleep(300)
     if not trainset_balance:
-        return [],[],[],[],False,[],[]
+        return [],[],[],[],False,[],[],{}
     print("domBB num: "+str(DOM_BB_NUM))
     print("seeds num: "+str(len(X)))
     model = S2DModel(DOM_BB_NUM)
     model.to(device)
     print(model)
-    model = train(model,X,y)
+    model, useful = train(model,X,y)
+    if not useful:
+        print('Model discarded; the fuzzer falls back to normal mutation until the next retrain.')
+        return [],[],[],[],True,[],[],{}
     model.eval()
-    seed_list = glob.glob(argvv[1] + '/queue/id*')
+    # Gradient rows must line up with X_filenames/DOM_BITS, which the query
+    # handler indexes by seed name. Only queue seeds can be queried, so
+    # backup samples are skipped.
+    grad_names = [name for name in X_filenames if name[0] == 'i']
+    if not grad_names:
+        return [],[],[],[],True,[],[],{}
+    grad_row = {name: row for row, name in enumerate(grad_names)}
     SEEDS = []
-    for seed in seed_list:
-        with open(seed,'r') as f: 
+    for name in grad_names:
+        with open(argvv[1] + '/queue/' + name,'rb') as f:
             f_bytes = np.fromfile(f, dtype=np.uint8)
             if len(f_bytes) > MAX_FILE_SIZE:
                 SEEDS.append(f_bytes[:MAX_FILE_SIZE])
             else:
                 f_bytes = np.pad(f_bytes,(0,MAX_FILE_SIZE-len(f_bytes)),'constant')
                 SEEDS.append(f_bytes)
-    seeds = torch.as_tensor(SEEDS, dtype=torch.float32) / 255
+    seeds = torch.as_tensor(np.asarray(SEEDS), dtype=torch.float32) / 255
     X = seeds.to(device)
     seeds_max_grad = [] # (idx_to_mutate, nb_seeds)
     seeds_grad = []
     for bb in range(DOM_BB_NUM):
         X.requires_grad = True
         model.zero_grad()
-        out = model.pre_grad_batch(X,bb) 
+        out = model.pre_grad_batch(X,bb)
         out.backward(torch.ones_like(out))
         grads_value = X.grad.cpu().numpy() # (nb_seeds,)
         seeds_grad.append(np.abs(grads_value))
         this_bb_byte_to_mutate = np.argmax(np.abs(grads_value),axis=1) # (nb_seeds,)
-        seeds_max_grad.append(this_bb_byte_to_mutate) 
+        seeds_max_grad.append(this_bb_byte_to_mutate)
         X.grad = None
     seeds_max_grad = np.asarray(seeds_max_grad)
     seeds_grad = np.asarray(seeds_grad)
 
-    return X_filenames, seeds_max_grad, DOM_BITS, seeds_grad, True, dom_bits_levels, trainset_levels
+    return X_filenames, seeds_max_grad, DOM_BITS, seeds_grad, True, dom_bits_levels, trainset_levels, grad_row
 
 if __name__ == '__main__': 
     X_filenames = []
@@ -588,6 +693,7 @@ if __name__ == '__main__':
     bytes_to_mutate_index = 0
     trainset_balance = True
     trainset_levels = []
+    grad_row = {} # seed name -> row in seeds_grad
 
     while True:
         r_data = myread()
@@ -618,6 +724,10 @@ if __name__ == '__main__':
                         if len(bytes_to_mutate) == 0:
                             print('seed covers '+str(cover_num)+' domBB(s), too poor!')
                             bytes_to_mutate.append(-1)
+                    elif len(trainset_levels) < 2:
+                        if len(bytes_to_mutate) == 0:
+                            print('trainset has a single coverage level, nothing to guide towards!')
+                            bytes_to_mutate.append(-1)
                     elif cover_num == int(trainset_levels[0]) and int(trainset_levels[0]) != int(trainset_levels[1]):
                         if len(bytes_to_mutate) == 0:
                             print('seed covers '+str(cover_num)+' domBB(s), too advanced!')
@@ -630,13 +740,14 @@ if __name__ == '__main__':
                         if len(bytes_to_mutate) == 0:
                             print('seed covers '+str(cover_num)+' domBB(s).')
                             cover_num = trans_vec_index(cover_num,dom_bits_levels)
+                            grad_index = grad_row[query] # seeds_grad rows are not in X_filenames order
                             grad_dict_f = {} # byte gradients corresponding to the first dom BB
                             grad_dict_d = {} # byte gradients corresponding to the deepest dom BB
                             grad_dict_s = {} # byte gradients corresponding to the second deepest dom BB
                             for i in range(min(seed_length[query],MAX_FILE_SIZE)):
-                                grad_dict_f[i] = seeds_grad[0][seed_index][i]
-                                grad_dict_d[i] = seeds_grad[cover_num][seed_index][i]
-                                grad_dict_s[i] = seeds_grad[cover_num-1][seed_index][i]
+                                grad_dict_f[i] = seeds_grad[0][grad_index][i]
+                                grad_dict_d[i] = seeds_grad[cover_num][grad_index][i]
+                                grad_dict_s[i] = seeds_grad[cover_num-1][grad_index][i]
                             dom_first = sorted(grad_dict_f.items(), key=lambda x:x[1], reverse=True) # gradients sorted from large to small
                             dom_deepest = sorted(grad_dict_d.items(), key=lambda x:x[1], reverse=True)                       
                             dom_second_deepest = sorted(grad_dict_s.items(), key=lambda x:x[1], reverse=True)
@@ -644,8 +755,11 @@ if __name__ == '__main__':
                                 dom_first[i] = dom_first[i][0]
                                 dom_deepest[i] = dom_deepest[i][0]  
                                 dom_second_deepest[i] = dom_second_deepest[i][0]
+                            # rank of each byte in the first/second-deepest orderings (list.index() here was O(n^2))
+                            rank_first = {byte: rank for rank, byte in enumerate(dom_first)}
+                            rank_second = {byte: rank for rank, byte in enumerate(dom_second_deepest)}
                             for i in range(len(dom_deepest)):
-                                if dom_first.index(dom_deepest[i]) > i and dom_second_deepest.index(dom_deepest[i]) >= i:
+                                if rank_first[dom_deepest[i]] > i and rank_second[dom_deepest[i]] >= i:
                                     bytes_to_mutate.append(dom_deepest[i])
                                     if len(bytes_to_mutate) == 20:
                                         break
@@ -655,7 +769,7 @@ if __name__ == '__main__':
                         elif bytes_to_mutate_index == len(bytes_to_mutate):
                             print('no more potential edges to mutate!')
                         bytes_to_mutate_index += 1
-                except:
+                except Exception:
                     if bytes_to_mutate_index == 0:
                         if query not in X_filenames:
                             if query in poor_seeds:
@@ -664,6 +778,7 @@ if __name__ == '__main__':
                                 print('The seed has not been included!')
                         else:
                             print('Maybe there is a bug!')
+                            traceback.print_exc()
                         bytes_to_mutate_index += 1
                     # send back MAX, let fuzzer random choice
                 if query not in seed_bytes_to_mutate.keys():
@@ -695,7 +810,7 @@ if __name__ == '__main__':
                 info('last trainset generation was ' + str(round(time.time() - train_last_time)) + 's ago!')
                 train_last_time = time.time()
             shm_hold()
-            X_filenames, seeds_max_grad,DOM_BITS,seeds_grad,trainset_balance,dom_bits_levels,trainset_levels = retrain()
+            X_filenames, seeds_max_grad,DOM_BITS,seeds_grad,trainset_balance,dom_bits_levels,trainset_levels,grad_row = retrain()
             shm_unlock()
 
         elif choice == b'ST': # init fuzzer

@@ -62,18 +62,17 @@ static std::vector<std::vector<std::string>> get_func_targets(){
       while(1){
         // a valid line must have a ","
         std::size_t found = read_line.find_last_of(",");
-        if (found != std::string::npos){
-          std::string caller = read_line.substr(found+1); // "main"
-          std::string left = read_line.substr(0,found); // "bof.c:23,doit"
-          std::size_t found_left = left.find_last_of(","); 
-          if (found_left != std::string::npos){
-            std::string callee = left.substr(found_left+1); // "doit"
-            std::vector<std::string> pair = {caller,callee}; // {"main","doit"}
-            errs()<< "caller: " << caller << " -> callee: " << callee << "\n";
-            func_targets.push_back(pair);
-            read_line = left; // "bof.c:23,doit"
-          } else { break; }
-        }
+        if (found == std::string::npos) break;
+        std::string caller = read_line.substr(found+1); // "main"
+        std::string left = read_line.substr(0,found); // "bof.c:23,doit"
+        std::size_t found_left = left.find_last_of(",");
+        if (found_left != std::string::npos){
+          std::string callee = left.substr(found_left+1); // "doit"
+          std::vector<std::string> pair = {caller,callee}; // {"main","doit"}
+          errs()<< "caller: " << caller << " -> callee: " << callee << "\n";
+          func_targets.push_back(pair);
+          read_line = left; // "bof.c:23,doit"
+        } else { break; }
       }
     }
   }
@@ -84,8 +83,6 @@ namespace {
   struct getCSAdditionalTargets : public ModulePass {
 
     static char ID;
-    // (N*M,2) N is the number of target basic blocks, M is the number of caller/callee pairs
-    static std::vector<std::vector<std::string>> func_targets; 
 
     getCSAdditionalTargets() : ModulePass(ID) {}
 
@@ -95,17 +92,27 @@ namespace {
 }  // end of anonymous namespace
 
 char getCSAdditionalTargets::ID = 0;
-std::vector<std::vector<std::string>> getCSAdditionalTargets::func_targets = get_func_targets();
 
 bool getCSAdditionalTargets::runOnModule(Module &M){
+  // Read the targets here rather than at plugin load time, so that -targets
+  // given on the command line is honored.
+  // (N*M,2) N is the number of target basic blocks, M is the number of caller/callee pairs
+  std::vector<std::vector<std::string>> func_targets = get_func_targets();
+
+  // opt runs this pass once on the whole-program bitcode, so start a fresh file.
   std::ofstream ftarget;
-  ftarget.open(OutFile, std::ios::app);
+  ftarget.open(OutFile, std::ios::trunc);
 
   for (auto tuple : func_targets){
     std::string caller = tuple[0];
     std::string callee = tuple[1];
     Function *F = M.getFunction((StringRef)caller);
-    
+    if (!F || F->isDeclaration()) {
+      errs() << "warning: caller " << caller << " is not defined in this module, skipping "
+             << caller << " -> " << callee << "\n";
+      continue;
+    }
+
     for (auto &BB : *F){
 
       /* Find the first valid instruction and name the bb with the
@@ -130,8 +137,10 @@ bool getCSAdditionalTargets::runOnModule(Module &M){
       }
 
       for (auto &I : BB){
-        if (auto *c = dyn_cast<CallInst>(&I)){
-          if (auto *CalledF = c->getCalledFunction()){
+        // CallBase covers call and invoke (C++ code with exceptions). Strip
+        // casts so direct calls through a bitcast function type are found too.
+        if (auto *c = dyn_cast<CallBase>(&I)){
+          if (auto *CalledF = dyn_cast<Function>(c->getCalledOperand()->stripPointerCasts())){
             if (CalledF->getName().str() == callee){
                 getDebugLoc(&I,curr_filename,curr_line);
                 /* Remove path prefix such as "./" */

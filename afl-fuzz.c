@@ -480,19 +480,19 @@ static int get_byte_to_mutate()
 {
   if (shm_check_hold(CPY_SHM))
     return -1;
-  int byte_to_mutate;
-  char *recvbuff;
-  char sendbuff[256] = "TA";
-  strcat(sendbuff, queue_cur->fname);
+  char recvbuff[SHM_MSG_MAX + 1];
+  char sendbuff[SHM_MSG_MAX + 1];
+  /* The NN only needs the file name; the full path may not fit in the shm. */
+  u8 *base = strrchr(queue_cur->fname, '/');
+  base = base ? base + 1 : queue_cur->fname;
+  if (snprintf(sendbuff, sizeof(sendbuff), "TA%s", base) >= (int)sizeof(sendbuff))
+    return -1;
   if (mywrite(sendbuff) == 0)
     return -1;
-  recvbuff = shm_check(CPY_SHM);
-  if (recvbuff)
-    byte_to_mutate = atoi(recvbuff); 
-  else
+  if (!myread(recvbuff, sizeof(recvbuff)))
     return -1;
-  
-  return byte_to_mutate;
+
+  return atoi(recvbuff);
 }
 
 /* Get unix time in milliseconds */
@@ -3443,8 +3443,6 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       return 0;
     }
 
-#ifndef SIMPLE_FILES
-
     u8 cur_dom_bits[MAP_SIZE] = {0}; /* bits of current seed's dominator edges */
     u32 is_key_edge = 0;
     u32 seed_max_dom_depth = 0;
@@ -3472,13 +3470,20 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     
     if (!backup_mode || hnb) {
       // save cur_dom_bits to file, file name is the same as the seed saved to out/queue/
+#ifndef SIMPLE_FILES
       fn = alloc_printf("%s/cur_dom_bits/id:%06u,%llu,%s,%u", out_dir, queued_paths,
                         time_stamp, describe_op(hnb),is_key_edge);
+#else
+      (void)time_stamp; /* only used in descriptive file names */
+      fn = alloc_printf("%s/cur_dom_bits/id_%06u", out_dir, queued_paths);
+#endif /* ^!SIMPLE_FILES */
 
       fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
       if (fd < 0) PFATAL("Unable to create '%s'", fn);
       ck_write(fd, cur_dom_bits, MAP_SIZE, fn);
-      close(fd); 
+      close(fd);
+
+#ifndef SIMPLE_FILES
 
       fn = alloc_printf("%s/queue/id:%06u,%llu,%s,%u", out_dir, queued_paths,
                         time_stamp, describe_op(hnb),is_key_edge);
@@ -3522,7 +3527,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       fn = alloc_printf("%s/queue_backup/round:%03u,id:%06u", out_dir, gen_round, backup_idx);
       fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
       if (fd < 0) PFATAL("Unable to create '%s'", fn);
-      ck_write(fd, cur_dom_bits, MAP_SIZE, fn);
+      ck_write(fd, mem, len, fn); /* the input itself; nn-dom.py trains on these bytes */
       close(fd); 
       backup_idx++;
       if (backup_idx == 500) {
@@ -8830,6 +8835,14 @@ int main(int argc, char** argv) {
   setup_shm();
   init_count_class16();
 
+  /* Create the C-Python shm before the (possibly long) dry run, so the NN
+     process never finds a missing or stale segment when it starts. */
+  if (grad_mode) {
+    if (!key_id) FATAL("-G requires a non-zero shared memory key (-K)");
+    ACTF("setup share memory");
+    get_shm_cpy(key_id);
+  }
+
   setup_dirs_fds();
   read_testcases();
   load_auto();
@@ -8875,16 +8888,7 @@ int main(int argc, char** argv) {
   }
 
   /* connect to python module */
-  if (grad_mode) {
-    ACTF("setup share memory");
-    if (key_id) {
-      get_shm_cpy(key_id);
-      mywrite("START FUZZ");
-    } else {
-      printf("invalid share memory key id!\n");
-      exit(0);
-    }
-  }
+  if (grad_mode) mywrite("START FUZZ");
 
   while (1) {
 
@@ -8963,10 +8967,13 @@ int main(int argc, char** argv) {
       edge_gain = now_edge - old_edge;
       if ((double)t > (double)t_x * 60.0) {
         if (old_edge == 0) {
-          old_edge = now_edge;
-          last_retrain = cur_ms;
-          old_queued_paths = queued_paths;
-          mywrite("RETRAIN\x00");
+          /* mywrite() no longer blocks; retry on the next iteration if the
+             NN has not picked up START FUZZ yet. */
+          if (mywrite("RETRAIN\x00")) {
+            old_edge = now_edge;
+            last_retrain = cur_ms;
+            old_queued_paths = queued_paths;
+          }
         } else if ((double)interval > (double)(MAX_RETRAIN_SPAN * 60.0)) {
           if (edge_gain > 30 || queued_paths - old_queued_paths >= 50 || (double)interval > (double)(MAX_RETRAIN_SPAN * 60.0 * 3))
             if (!shm_check_hold(CPY_SHM))

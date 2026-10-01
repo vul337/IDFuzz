@@ -4,8 +4,8 @@ set -e
 PUT_NAME=${1:-"objdump"}
 INPUT_DIR=${2:-"in"}
 OUTPUT_DIR=${3:-"out"}
-SHM_ID=${4:-5}
-TIMEOUT=${5:-"5m"}
+SHM_ID=${4:-$(( 0x1D000000 + $$ ))} # unique per run so parallel campaigns don't share a segment
+TIMEOUT=${5:-"10m"}
 ARGS=${6:-"-SD @@"}
 NN_LOG=$TMP_DIR/nn.log
 

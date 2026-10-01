@@ -45,6 +45,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
@@ -61,6 +62,7 @@
 #include <iostream>
 #include <list>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -87,10 +89,11 @@ namespace {
 
     public:
       SmallVector<BlockInfo, 16> AFLBlockInfoVec;
-      SmallVector<unsigned int, 16> DominatorBBid;
+      DenseMap<BasicBlock *, unsigned> BlockIndex; // BB -> index in AFLBlockInfoVec
+      std::set<unsigned int> DominatorBBid;
       std::map<unsigned int, std::vector<std::string>> DomId2target; // a dominator can dominate multiple targets
-      SmallVector<unsigned int, 16> TargetBBid;
-      std::map<unsigned int, std::vector<std::string>> Id2target; 
+      std::set<unsigned int> TargetBBid;
+      std::map<unsigned int, std::vector<std::string>> Id2target;
       BlockInfo *getBlockInfo(BasicBlock *BB);
 
       static char ID;
@@ -126,6 +129,58 @@ static void getDebugLoc(const Instruction *I, std::string &Filename,
       }
     }
   }
+}
+
+struct TargetLoc {
+  std::string File;
+  unsigned Line;
+};
+
+/* Parse "path/file.c:123" targets into basename and line, once. */
+static std::vector<TargetLoc> parseTargets(const std::list<std::string> &Targets) {
+  std::vector<TargetLoc> Locs;
+  for (std::string target : Targets) {
+    std::size_t found = target.find_last_of("/\\");
+    if (found != std::string::npos)
+      target = target.substr(found + 1);
+    std::size_t pos = target.find_last_of(":");
+    Locs.push_back({target.substr(0, pos),
+                    (unsigned int)atoi(target.substr(pos + 1).c_str())});
+  }
+  return Locs;
+}
+
+/* Append "file:line" for every (instruction, target) pair of BB whose debug
+   location matches, in instruction order. An instruction without a location
+   inherits the previous one's, as getDebugLoc() leaves its outputs alone.
+   LastFile/LastLine receive the location after the last instruction. */
+static void matchTargets(BasicBlock &BB, const std::vector<TargetLoc> &Locs,
+                         std::vector<std::string> &Out,
+                         std::string *LastFile = nullptr,
+                         unsigned *LastLine = nullptr) {
+  static const std::string Xlibs("/usr/");
+  std::string filename = "";
+  unsigned line = 0;
+
+  for (auto &I : BB) {
+    getDebugLoc(&I, filename, line);
+
+    /* Remove path prefix such as "./" */
+    std::size_t found = filename.find_last_of("/\\");
+    if (found != std::string::npos)
+      filename = filename.substr(found + 1);
+
+    /* Skip external libs */
+    if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
+      continue;
+
+    for (auto &T : Locs)
+      if (T.File == filename && T.Line == line)
+        Out.push_back(filename + ":" + std::to_string(line));
+  }
+
+  if (LastFile) *LastFile = filename;
+  if (LastLine) *LastLine = line;
 }
 
 bool AFLCoverage::runOnModule(Module &M) {
@@ -212,10 +267,27 @@ bool AFLCoverage::runOnModule(Module &M) {
 
   int inst_blocks = 0;
 
+  /* Parse the targets once instead of for every instruction. */
+  std::vector<TargetLoc> TargetLocs = parseTargets(targets);
+  std::vector<TargetLoc> DirectLocs = parseTargets(targets_direct);
+
   for (auto &F : M) {
     if (!F.isDeclaration() && !F.empty()) {
       auto &DT = getAnalysis<DominatorTreeWrapperPass>(F).getDomTree();
       errs() << cCYA "[*] DominatorTree generated for function: " << F.getName() << "\n" cRST;
+
+      /* Targets matched by each block, computed once per function instead of
+         once per (dominator, descendant) pair. Functions without any target
+         line skip the dominator-tree walk entirely. */
+      DenseMap<BasicBlock *, std::vector<std::string>> BlockTargets;
+      bool FunctionHasTarget = false;
+      for (auto &BB : F) {
+        std::vector<std::string> Matches;
+        matchTargets(BB, TargetLocs, Matches);
+        if (!Matches.empty()) FunctionHasTarget = true;
+        BlockTargets[&BB] = std::move(Matches);
+      }
+
       std::vector<BasicBlock *> InsBlocks;
       for (auto &BB : F) {
         if (F.size() == 1) {
@@ -237,81 +309,37 @@ bool AFLCoverage::runOnModule(Module &M) {
         BasicBlock *curr_bb = &BB;
         auto node = DT.getNode(curr_bb);
         unsigned curr_level = node->getLevel();
-        DT.getDescendants(curr_bb, Descendants);
         BlockInfo CurBlockInfo;
         CurBlockInfo.BlockAddr = BlockAddress::get(&BB);
         CurBlockInfo.BlockId = cur_loc;
         CurBlockInfo.BlockLevel = curr_level;
         AFLBlockInfoVec.push_back(CurBlockInfo);
+        BlockIndex.insert({&BB, AFLBlockInfoVec.size() - 1}); // first entry wins, like the old linear scan
         std::string curr_filename = "";
         unsigned curr_line = 0;
-        static const std::string Xlibs("/usr/");
 
-        /* Find the first valid instruction and name the bb with the
-         * corresponding filename and line number*/
-        for (auto &I : BB) {
-          getDebugLoc(&I, curr_filename, curr_line);
-
-          /* Remove path prefix such as "./" */
-          std::size_t found = curr_filename.find_last_of("/\\");
-          if (found != std::string::npos)
-            curr_filename = curr_filename.substr(found + 1);
-
-          if (curr_filename.empty() || curr_line == 0 || !curr_filename.compare(0, Xlibs.size(), Xlibs))
-            continue;
-          for (auto &target : targets_direct) {
-            std::size_t found = target.find_last_of("/\\");
-            if (found != std::string::npos)
-              target = target.substr(found + 1);
-            std::size_t pos = target.find_last_of(":");
-            std::string target_file = target.substr(0, pos);
-            unsigned int target_line = atoi(target.substr(pos + 1).c_str());
-
-            if (target_file == curr_filename && target_line == curr_line) {
-              errs() << cGRN "[*] Found direct_target bb: " << curr_filename << ":"
-                      << curr_line << " | bb id: " << cur_loc
-                      << " | Level: " << curr_level << "\n" cRST;
-              TargetBBid.push_back(cur_loc);
-              Id2target[cur_loc].push_back(curr_filename + ":" + std::to_string(curr_line));
-            }
-          }
+        /* Find the instructions of this bb that are direct targets */
+        std::vector<std::string> DirectMatches;
+        matchTargets(BB, DirectLocs, DirectMatches, &curr_filename, &curr_line);
+        for (auto &target_direct : DirectMatches) {
+          errs() << cGRN "[*] Found direct_target bb: " << target_direct
+                  << " | bb id: " << cur_loc
+                  << " | Level: " << curr_level << "\n" cRST;
+          TargetBBid.insert(cur_loc);
+          Id2target[cur_loc].push_back(target_direct);
         }
 
         /********* Check targets and save cur_loc *********/
-        for (auto &bb : Descendants) {
-          std::string filename;
-          unsigned line;
-
-          for (auto &bbi : *bb) {
-            getDebugLoc(&bbi, filename, line);
-
-            /* Remove path prefix */
-            std::size_t found = filename.find_last_of("/\\");
-            if (found != std::string::npos)
-              filename = filename.substr(found + 1);
-
-            /* Skip external libs */
-            static const std::string Xlibs("/usr/");
-            if (filename.empty() || line == 0 || !filename.compare(0, Xlibs.size(), Xlibs))
-              continue;
-
-            for (auto &target : targets) {
-              std::size_t found = target.find_last_of("/\\");
-              if (found != std::string::npos)
-                target = target.substr(found + 1);
-              std::size_t pos = target.find_last_of(":");
-              std::string target_file = target.substr(0, pos);
-              unsigned int target_line = atoi(target.substr(pos + 1).c_str());
-
-              if (target_file == filename && target_line == line) {
-                errs() << cGRN "[*] Found target bb: " << filename << ":"
-                       << line << "\n" cRST;
-                errs() << cGRN "[*] Current bb: " << curr_filename << ":"
-                       << curr_line << " | bb id: " << cur_loc
-                       << " | Level: " << curr_level << "\n" cRST;
-                DominatorBBid.push_back(cur_loc);
-                DomId2target[cur_loc].push_back(filename + ":" + std::to_string(line));
-              }
+        if (FunctionHasTarget) {
+          DT.getDescendants(curr_bb, Descendants);
+          for (auto &bb : Descendants) {
+            for (auto &target : BlockTargets[bb]) {
+              errs() << cGRN "[*] Found target bb: " << target << "\n" cRST;
+              errs() << cGRN "[*] Current bb: " << curr_filename << ":"
+                     << curr_line << " | bb id: " << cur_loc
+                     << " | Level: " << curr_level << "\n" cRST;
+              DominatorBBid.insert(cur_loc);
+              DomId2target[cur_loc].push_back(target);
             }
           }
         }
@@ -331,20 +359,8 @@ bool AFLCoverage::runOnModule(Module &M) {
           BlockInfo *ptrCurrentBBInfo = getBlockInfo(origBB);
           unsigned int CurrentBBid = ptrCurrentBBInfo->BlockId;
 
-          int flag = 0;
-          int flag_target = 0;
-          for (auto TargetID : TargetBBid) {
-            if (TargetID == CurrentBBid) {
-              flag_target = 1;
-              break;
-            }
-          }
-          for (auto DominatorID : DominatorBBid) {
-            if (DominatorID == CurrentBBid) {
-              flag = 1;
-              break;
-            }
-          }
+          int flag = DominatorBBid.count(CurrentBBid) ? 1 : 0;
+          int flag_target = TargetBBid.count(CurrentBBid) ? 1 : 0;
           if (flag) {
             errs() << "current bb ID:" << CurrentBBid << " Level: " << ptrCurrentBBInfo->BlockLevel << "\n";
           }
@@ -386,18 +402,8 @@ bool AFLCoverage::runOnModule(Module &M) {
             if(ptrSuccessorBBInfo) {
               SuccessorBBId = ptrSuccessorBBInfo->BlockId;
               if(SuccessorBBId!=CurrentBBid) {
-                for (auto DominatorID : DominatorBBid) {
-                  if (DominatorID == SuccessorBBId) {
-                    flag_succ = 1;
-                    break;
-                  }
-                }
-                for (auto TargetID : TargetBBid) {
-                  if (TargetID == SuccessorBBId) {
-                    flag_succ = 1;
-                    break;
-                  }
-                }
+                if (DominatorBBid.count(SuccessorBBId) || TargetBBid.count(SuccessorBBId))
+                  flag_succ = 1;
               }
             }
             BasicBlock::iterator IP = newBB->getFirstInsertionPt();
@@ -486,17 +492,15 @@ bool AFLCoverage::runOnModule(Module &M) {
 
 }
 
-// iterate the vec to get the corresponding random BBlockId by BB class
-// rvalue is BBlockId
+// look up the BlockInfo (and its random BBlockId) recorded for BB
 BlockInfo *AFLCoverage::getBlockInfo(BasicBlock *BB) {
-  // get the addr of this preBlock in order to get the BlockId of this addr
-  BlockAddress *BlcAddr = BlockAddress::get(BB);
-  // iterate the vec to get the corresponding BlockId
-  for (auto &I : AFLBlockInfoVec) {
-    if (I.BlockAddr == BlcAddr) {
-      return &I;
-    }
-  }
+  // The old linear scan compared BlockAddress constants. BlockAddress::get()
+  // is still called so the constants it creates, and thus the instrumented
+  // output, stay exactly the same.
+  BlockAddress::get(BB);
+  auto It = BlockIndex.find(BB);
+  if (It != BlockIndex.end())
+    return &AFLBlockInfoVec[It->second];
   errs() << "There is no corresponding BB in the array\n";
   return nullptr;
 }

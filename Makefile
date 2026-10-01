@@ -69,7 +69,7 @@ afl-as: afl-as.c afl-as.h $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
 	ln -sf afl-as as
 
-afl-fuzz: afl-fuzz.c $(COMM_HDR) | test_x86
+afl-fuzz: afl-fuzz.c shmutils.c shmutils.h $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c shmutils.c -o $@ $(LDFLAGS)
 
 afl-showmap: afl-showmap.c $(COMM_HDR) | test_x86
